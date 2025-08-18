@@ -78,30 +78,33 @@ if (process.env.NODE_ENV !== 'production') {
   logger.add(new winston.transports.Console({ format: winston.format.simple() }));
 }
 
-// --- CORS Setup ---
+// --- CORS Setup (Updated with fixes) ---
 const allowedOrigins = ALLOWED_ORIGIN.split(',').map(o => o.trim());
 console.log('Allowed CORS origins:', allowedOrigins);
 
 const corsOptions = {
   origin: (origin, callback) => {
-    // Always allow requests with no origin (like preflight or curl)
-    if (!origin) {
-      callback(null, true);
-    } else if (allowedOrigins.includes(origin)) {
-      callback(null, origin);
-    } else {
-      logger.warn('CORS rejected', { origin, allowedOrigins });
-      callback(new Error(`CORS policy: Origin ${origin} not allowed`));
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
     }
+    
+    const msg = `CORS policy: Origin ${origin} not allowed`;
+    logger.warn(msg, { origin, allowedOrigins });
+    return callback(new Error(msg));
   },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type'],
+  methods: ['GET', 'POST', 'OPTIONS', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
-  optionsSuccessStatus: 200,
+  optionsSuccessStatus: 204, // Some legacy browsers choke on 200
+  preflightContinue: false,
 };
 
+// Apply CORS middleware before other middleware
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
+app.options('*', cors(corsOptions)); // Enable preflight for all routes
 
 // --- Other Middleware ---
 app.use(helmet());
@@ -115,6 +118,11 @@ app.use(prom({
   collectDefaultMetrics: true,
   requestDurationBuckets: [0.1, 0.5, 1, 1.5],
 }));
+
+// --- Health Check Endpoint ---
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
 
 // --- Rate Limiting ---
 const apiLimiter = rateLimit({
@@ -182,12 +190,6 @@ const retry = async (fn, retries = 3, delay = 1000) => {
   }
 };
 
-// --- Global Error Handler ---
-app.use((err, req, res, next) => {
-  logger.error('Unhandled error', { message: err.message, stack: err.stack });
-  res.status(500).json({ error: 'Internal server error' });
-});
-
 // --- Summarize Endpoint ---
 app.post('/api/summarize', asyncHandler(async (req, res) => {
   const { transcript, instruction } = req.body ?? {};
@@ -241,7 +243,13 @@ app.post('/api/share', asyncHandler(async (req, res) => {
   res.json({ ok: true, queued: true });
 }));
 
+// --- Global Error Handler ---
+app.use((err, req, res, next) => {
+  logger.error('Unhandled error', { message: err.message, stack: err.stack });
+  res.status(500).json({ error: 'Internal server error' });
+});
+
 // --- Start Server ---
 app.listen(PORT, () => {
-  logger.info(`Backend running on http://localhost:${PORT}`);
-  console.log(`Backend
+  logger.info(`Server listening on port ${PORT}`);
+});
