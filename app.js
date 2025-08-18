@@ -9,9 +9,8 @@ const validator = require('validator');
 const Groq = require('groq-sdk');
 const { Resend } = require('resend');
 const { cleanEnv, str, num, email } = require('envalid');
-const { createClient } = require('redis');
+const { Redis } = require('@upstash/redis');
 const { createHash } = require('crypto');
-const Queue = require('bull');
 const prom = require('express-prometheus-middleware');
 const { setTimeout } = require('timers/promises');
 
@@ -23,10 +22,11 @@ const env = cleanEnv(process.env, {
   RESEND_API_KEY: str(),
   MAIL_FROM: email(),
   PORT: num({ default: 5000 }),
-  ALLOWED_ORIGIN: str({ default: 'http://localhost:5173' }),
+  ALLOWED_ORIGIN: str({ default: 'http://localhost:5173,https://frontend-scribe.onrender.com' }),
   MAX_TRANSCRIPT_CHARS: num({ default: 50000 }),
   MAX_RECIPIENTS: num({ default: 10 }),
-  REDIS_URL: str({ default: 'redis://localhost:6379' }),
+  REDIS_URL: str(),
+  REDIS_TOKEN: str(),
 });
 
 const {
@@ -38,12 +38,25 @@ const {
   MAX_TRANSCRIPT_CHARS: MAX_TRANSCRIPT,
   MAX_RECIPIENTS: MAX_RECIPIENTS_NUM,
   REDIS_URL,
+  REDIS_TOKEN,
 } = env;
 
-// --- Initialize Redis ---
-const redisClient = createClient({ url: REDIS_URL });
-redisClient.on('error', (err) => console.error('Redis error:', err));
-redisClient.connect().catch(console.error);
+// --- Initialize Upstash Redis ---
+const redisClient = new Redis({
+  url: REDIS_URL,
+  token: REDIS_TOKEN,
+});
+
+// Test Redis connection
+(async () => {
+  try {
+    const result = await redisClient.ping();
+    console.log('✅ Connected to Upstash Redis:', result);
+  } catch (err) {
+    console.error('❌ Upstash Redis connection failed:', err);
+    process.exit(1);
+  }
+})();
 
 // --- Initialize Express ---
 const app = express();
@@ -60,6 +73,7 @@ const logger = winston.createLogger({
     new winston.transports.File({ filename: 'combined.log' }),
   ],
 });
+
 if (process.env.NODE_ENV !== 'production') {
   logger.add(new winston.transports.Console({ format: winston.format.simple() }));
 }
@@ -67,6 +81,7 @@ if (process.env.NODE_ENV !== 'production') {
 // --- CORS Setup ---
 const allowedOrigins = ALLOWED_ORIGIN.split(',').map(o => o.trim());
 console.log('Allowed CORS origins:', allowedOrigins);
+
 const corsOptions = {
   origin: (origin, callback) => {
     if (!origin || allowedOrigins.includes(origin)) {
@@ -81,6 +96,7 @@ const corsOptions = {
   credentials: true,
   optionsSuccessStatus: 200,
 };
+
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 
@@ -88,7 +104,6 @@ app.options('*', cors(corsOptions));
 app.use(helmet());
 app.use(express.json({ limit: '1mb' }));
 app.use((req, res, next) => {
-  console.log('Parsed body:', req.body);
   logger.info(`${req.method} ${req.url}`, { ip: req.ip, origin: req.headers.origin, body: req.body });
   next();
 });
@@ -113,23 +128,34 @@ app.use('/api/', apiLimiter);
 const groq = new Groq({ apiKey: GROQ_API_KEY });
 const resend = new Resend(RESEND_API_KEY);
 
-// --- Email Queue ---
-const emailQueue = new Queue('email-sending', REDIS_URL);
-emailQueue.process(async (job) => {
-  const { summaryHtml, summaryText, recipients } = job.data;
-  const cleanHtml = sanitizeHtml(summaryHtml, {
-    allowedTags: sanitizeHtml.defaults.allowedTags.concat(['h1', 'h2', 'h3']),
-    allowedAttributes: { a: ['href', 'name', 'target'], img: ['src', 'alt'] },
-  });
-
-  return await resend.emails.send({
-    from: MAIL_FROM_ADDRESS,
-    to: recipients,
-    subject: 'Meeting Summary',
-    html: cleanHtml,
-    text: summaryText || cleanHtml.replace(/<[^>]+>/g, ''),
-  });
-});
+// --- Simple Email Queue (async, for Upstash REST) ---
+const emailQueue = [];
+const processEmailQueue = async () => {
+  while (true) {
+    if (emailQueue.length > 0) {
+      const job = emailQueue.shift();
+      try {
+        const { summaryHtml, summaryText, recipients } = job;
+        const cleanHtml = sanitizeHtml(summaryHtml, {
+          allowedTags: sanitizeHtml.defaults.allowedTags.concat(['h1', 'h2', 'h3']),
+          allowedAttributes: { a: ['href', 'name', 'target'], img: ['src', 'alt'] },
+        });
+        await resend.emails.send({
+          from: MAIL_FROM_ADDRESS,
+          to: recipients,
+          subject: 'Meeting Summary',
+          html: cleanHtml,
+          text: summaryText || cleanHtml.replace(/<[^>]+>/g, ''),
+        });
+        console.log(`✅ Email sent to ${recipients.join(', ')}`);
+      } catch (err) {
+        console.error('❌ Failed to send email:', err);
+      }
+    }
+    await setTimeout(1000);
+  }
+};
+processEmailQueue();
 
 // --- Helpers ---
 const asyncHandler = (fn) => (req, res, next) =>
@@ -155,94 +181,67 @@ const retry = async (fn, retries = 3, delay = 1000) => {
 
 // --- Global Error Handler ---
 app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err.message, err.stack);
+  logger.error('Unhandled error', { message: err.message, stack: err.stack });
   res.status(500).json({ error: 'Internal server error' });
 });
 
 // --- Summarize Endpoint ---
-app.post(
-  '/api/summarize',
-  asyncHandler(async (req, res) => {
-    console.log('POST /api/summarize, Origin:', req.headers.origin, 'Body:', req.body);
-    const { transcript, instruction } = req.body ?? {};
+app.post('/api/summarize', asyncHandler(async (req, res) => {
+  const { transcript, instruction } = req.body ?? {};
+  if (!transcript || typeof transcript !== 'string' || !transcript.trim()) {
+    return res.status(400).json({ error: 'Transcript required' });
+  }
 
-    if (!transcript || typeof transcript !== 'string' || !transcript.trim()) {
-      console.log('Rejecting request: Invalid transcript');
-      return res.status(400).json({ error: 'Transcript required' });
-    }
+  let trimmedTranscript = transcript.trim();
+  if (trimmedTranscript.length > MAX_TRANSCRIPT) {
+    trimmedTranscript = trimmedTranscript.slice(0, MAX_TRANSCRIPT);
+  }
 
-    let trimmedTranscript = transcript.trim();
-    if (trimmedTranscript.length > MAX_TRANSCRIPT) {
-      trimmedTranscript = trimmedTranscript.slice(0, MAX_TRANSCRIPT);
-    }
+  const prompt = instruction?.trim() || 'Summarize in bullet points: TL;DR, Decisions, Action Items, Risks';
+  const cacheKey = createHash('md5').update(`${prompt}:${trimmedTranscript}`).digest('hex');
+  const cachedSummary = await redisClient.get(cacheKey);
 
-    const prompt =
-      instruction && typeof instruction === 'string' && instruction.trim()
-        ? instruction.trim()
-        : 'Summarize in bullet points: TL;DR, Decisions, Action Items, Risks';
+  if (cachedSummary) return res.json({ summary: cachedSummary, cached: true });
 
-    const cacheKey = createHash('md5').update(`${prompt}:${trimmedTranscript}`).digest('hex');
-    const cachedSummary = await redisClient.get(cacheKey);
+  const systemMsg = { role: 'system', content: 'You are an expert meeting-note summarizer.' };
+  const userMsg = { role: 'user', content: `${prompt}\n\nTranscript:\n${trimmedTranscript}` };
 
-    if (cachedSummary) {
-      console.log('Returning cached summary');
-      return res.json({ summary: cachedSummary, cached: true });
-    }
+  try {
+    const completion = await retry(() => groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [systemMsg, userMsg],
+    }));
 
-    const systemMsg = { role: 'system', content: 'You are an expert meeting-note summarizer.' };
-    const userMsg = { role: 'user', content: `${prompt}\n\nTranscript:\n${trimmedTranscript}` };
+    const summary = completion?.choices?.[0]?.message?.content ?? null;
+    if (!summary) return res.status(502).json({ error: 'No summary generated by model' });
 
-    try {
-      const completion = await retry(() =>
-        groq.chat.completions.create({
-          model: 'llama-3.3-70b-versatile',
-          messages: [systemMsg, userMsg],
-        })
-      );
-
-      const summary = completion?.choices?.[0]?.message?.content ?? null;
-
-      if (!summary) {
-        console.log('No summary generated');
-        return res.status(502).json({ error: 'No summary generated by model' });
-      }
-
-      const safeSummary = sanitizeHtml(summary, { allowedTags: [], allowedAttributes: {} });
-      await redisClient.setEx(cacheKey, 3600, safeSummary);
-      console.log('Returning new summary');
-      res.json({ summary: safeSummary });
-    } catch (err) {
-      console.error('Groq API error:', err.message, err.stack);
-      return res.status(502).json({ error: `Groq API error: ${err.message}` });
-    }
-  })
-);
+    const safeSummary = sanitizeHtml(summary, { allowedTags: [], allowedAttributes: {} });
+    await redisClient.set(cacheKey, safeSummary, { ex: 3600 });
+    res.json({ summary: safeSummary });
+  } catch (err) {
+    logger.error('Groq API error', { message: err.message, stack: err.stack });
+    res.status(502).json({ error: `Groq API error: ${err.message}` });
+  }
+}));
 
 // --- Share via Email ---
-app.post(
-  '/api/share',
-  asyncHandler(async (req, res) => {
-    console.log('POST /api/share, Origin:', req.headers.origin, 'Body:', req.body);
-    const { summaryHtml, summaryText, recipients } = req.body ?? {};
+app.post('/api/share', asyncHandler(async (req, res) => {
+  const { summaryHtml, summaryText, recipients } = req.body ?? {};
 
-    if (!summaryHtml || typeof summaryHtml !== 'string' || !summaryHtml.trim()) {
-      return res.status(400).json({ error: 'summaryHtml is required' });
-    }
+  if (!summaryHtml?.trim()) return res.status(400).json({ error: 'summaryHtml is required' });
 
-    const validRecipients = validateRecipients(recipients);
-    if (!validRecipients.length) {
-      return res.status(400).json({ error: 'Provide at least one valid recipient email' });
-    }
-    if (validRecipients.length > MAX_RECIPIENTS_NUM) {
-      return res.status(400).json({ error: `Maximum ${MAX_RECIPIENTS_NUM} recipients allowed` });
-    }
+  const validRecipients = validateRecipients(recipients);
+  if (!validRecipients.length) return res.status(400).json({ error: 'Provide at least one valid recipient email' });
+  if (validRecipients.length > MAX_RECIPIENTS_NUM) return res.status(400).json({ error: `Maximum ${MAX_RECIPIENTS_NUM} recipients allowed` });
 
-    const job = await emailQueue.add({ summaryHtml, summaryText, recipients });
-    res.json({ ok: true, jobId: job.id });
-  })
-);
+  emailQueue.push({ summaryHtml, summaryText, recipients });
+  res.json({ ok: true, queued: true });
+}));
 
 // --- Start Server ---
 app.listen(PORT, () => {
   logger.info(`Backend running on http://localhost:${PORT}`);
+  console.log(`Backend running on http://localhost:${PORT}`);
 });
+
+
