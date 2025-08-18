@@ -84,8 +84,11 @@ console.log('Allowed CORS origins:', allowedOrigins);
 
 const corsOptions = {
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, origin || true);
+    // Always allow requests with no origin (like preflight or curl)
+    if (!origin) {
+      callback(null, true);
+    } else if (allowedOrigins.includes(origin)) {
+      callback(null, origin);
     } else {
       logger.warn('CORS rejected', { origin, allowedOrigins });
       callback(new Error(`CORS policy: Origin ${origin} not allowed`));
@@ -241,7 +244,4 @@ app.post('/api/share', asyncHandler(async (req, res) => {
 // --- Start Server ---
 app.listen(PORT, () => {
   logger.info(`Backend running on http://localhost:${PORT}`);
-  console.log(`Backend running on http://localhost:${PORT}`);
-});
-
-
+  console.log(`Backend
