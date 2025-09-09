@@ -171,8 +171,12 @@ app.post('/api/summarize', async (req, res) => {
     }
 
     const trimmedTranscript = transcript.trim().slice(0, MAX_TRANSCRIPT);
-    const prompt = instruction?.trim() || 'Summarize in bullet points: TL;DR, Decisions, Action Items, Risks';
-    const cacheKey = createHash('md5').update(`${prompt}:${trimmedTranscript}`).digest('hex');
+    const prompt =
+      instruction?.trim() ||
+      'Summarize in bullet points: TL;DR, Decisions, Action Items, Risks';
+    const cacheKey = createHash('md5')
+      .update(`${prompt}:${trimmedTranscript}`)
+      .digest('hex');
 
     // Check cache
     const cachedSummary = await redisClient.get(cacheKey);
@@ -180,29 +184,46 @@ app.post('/api/summarize', async (req, res) => {
       return res.json({ summary: cachedSummary, cached: true });
     }
 
-    // Generate new summary
-    const completion = await groq.chat.completions.create({
-      model: 'llama3-70b-8192',
-      messages: [
-        { role: 'system', content: 'You are an expert meeting-note summarizer.' },
-        { role: 'user', content: `${prompt}\n\nTranscript:\n${trimmedTranscript}` }
-      ],
-      temperature: 0.7,
-    });
+    // Prepare messages
+    const messages = [
+      { role: "system", content: "You are an expert meeting-note summarizer." },
+      { role: "user", content: `${prompt}\n\nTranscript:\n${trimmedTranscript}` }
+    ];
+
+    let completion;
+    try {
+      // Try high-quality model first
+      completion = await groq.chat.completions.create({
+        model: "llama-3.1-70b-versatile",
+        messages,
+        temperature: 0.7,
+      });
+    } catch (err) {
+      logger.warn("70B model failed, falling back to 8B", { error: err.message });
+      // Fallback to faster/cheaper model
+      completion = await groq.chat.completions.create({
+        model: "llama-3.1-8b-instant",
+        messages,
+        temperature: 0.7,
+      });
+    }
 
     const summary = completion?.choices?.[0]?.message?.content;
     if (!summary) throw new Error('No summary generated');
 
-    const safeSummary = sanitizeHtml(summary, { allowedTags: [], allowedAttributes: {} });
+    const safeSummary = sanitizeHtml(summary, {
+      allowedTags: [],
+      allowedAttributes: {},
+    });
+
     await redisClient.set(cacheKey, safeSummary, { ex: 3600 });
 
     res.json({ summary: safeSummary, cached: false });
-
   } catch (err) {
-    logger.error('Summarization error', {
+    logger.error("Summarization error", {
       error: err.message,
       stack: err.stack,
-      body: req.body
+      body: req.body,
     });
     res.status(400).json({ error: err.message });
   }
